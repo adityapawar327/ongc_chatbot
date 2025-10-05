@@ -151,7 +151,7 @@ with st.sidebar:
                     
                     if not text.strip():
                         st.error("❌ Could not extract text from PDF. Please ensure it's not a scanned image.")
-                        return
+                        st.stop()
                     
                     st.info(f"📄 Extracted {len(text):,} characters from {page_count} pages")
                     
