@@ -22,22 +22,30 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = None
+if "pdf_info" not in st.session_state:
+    st.session_state.pdf_info = None
 
 def extract_pdf_text(pdf_file):
-    """Extract text from uploaded PDF"""
+    """Extract text from uploaded PDF with page tracking"""
     pdf_reader = PdfReader(pdf_file)
     text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text()
-    return text
+    page_count = len(pdf_reader.pages)
+    
+    for page_num, page in enumerate(pdf_reader.pages, 1):
+        page_text = page.extract_text()
+        if page_text.strip():  # Only add non-empty pages
+            text += f"\n--- Page {page_num} ---\n{page_text}"
+    
+    return text, page_count
 
 def create_vectorstore(text, api_key):
-    """Create FAISS vectorstore from text"""
-    # Split text into chunks with overlap for context preservation
+    """Create FAISS vectorstore from text with optimized chunking"""
+    # Optimized chunking for better retrieval
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
+        chunk_size=800,  # Smaller chunks for better precision
+        chunk_overlap=150,  # Good overlap to maintain context
+        length_function=len,
+        separators=["\n\n", "\n", ". ", " ", ""]  # Smart splitting
     )
     chunks = text_splitter.split_text(text)
     
@@ -48,51 +56,57 @@ def create_vectorstore(text, api_key):
         encode_kwargs={'normalize_embeddings': True}
     )
     
-    # Create vectorstore
-    vectorstore = FAISS.from_texts(chunks, embeddings)
+    # Create vectorstore with metadata
+    metadatas = [{"chunk_id": i, "total_chunks": len(chunks)} for i in range(len(chunks))]
+    vectorstore = FAISS.from_texts(chunks, embeddings, metadatas=metadatas)
     return vectorstore
 
 def create_qa_chain(vectorstore, api_key):
-    """Create QA chain with precise retrieval settings"""
-    # Custom prompt for exact answers with clear formatting
-    prompt_template = """You are a helpful assistant that answers questions based on PDF documents.
+    """Create production-grade QA chain with comprehensive retrieval"""
+    # Enhanced prompt for production-grade responses
+    prompt_template = """You are an expert document analysis assistant. Your task is to provide accurate, comprehensive answers based on the PDF document.
 
-Use the following context from the PDF to answer the question accurately and concisely.
+INSTRUCTIONS:
+1. Analyze ALL the provided context carefully
+2. Extract and synthesize relevant information from multiple sections if needed
+3. Provide complete, well-structured answers
+4. Use bullet points for lists, clear paragraphs for explanations
+5. Include specific details, numbers, dates, and quotes when available
+6. If information is partial, state what you found and what's missing
+7. Only say "I cannot find this information in the PDF" if truly absent
 
-Rules:
-- Answer ONLY based on the provided context
-- If the answer is not in the context, say "I cannot find this information in the PDF"
-- Provide specific information and quotes from the PDF
-- Format your answer clearly with bullet points or paragraphs as appropriate
-- Do not add external knowledge
-
-Context from PDF:
+CONTEXT FROM PDF:
 {context}
 
-Question: {question}
+QUESTION: {question}
 
-Answer:"""
+COMPREHENSIVE ANSWER:"""
     
     PROMPT = PromptTemplate(
         template=prompt_template,
         input_variables=["context", "question"]
     )
     
-    # Initialize Gemini with temperature=0 for deterministic responses
+    # Initialize Gemini with optimized settings
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.0-flash-exp",
         google_api_key=api_key,
-        temperature=0,  # No randomness
+        temperature=0.1,  # Slight creativity for better synthesis
+        max_output_tokens=2048,  # Allow longer responses
         convert_system_message_to_human=True
     )
     
-    # Create retrieval chain
+    # Create retrieval chain with enhanced retrieval
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
         retriever=vectorstore.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 4}  # Retrieve top 4 most relevant chunks
+            search_type="mmr",  # Maximum Marginal Relevance for diversity
+            search_kwargs={
+                "k": 8,  # Retrieve more chunks for comprehensive coverage
+                "fetch_k": 20,  # Consider more candidates
+                "lambda_mult": 0.7  # Balance relevance vs diversity
+            }
         ),
         return_source_documents=True,
         chain_type_kwargs={"prompt": PROMPT}
@@ -101,8 +115,8 @@ Answer:"""
     return qa_chain
 
 # UI
-st.title("📚 PDF RAG Chatbot with Google Gemini")
-st.markdown("Upload a PDF and ask questions - get exact answers from the document")
+st.title("📚 Production-Grade PDF RAG Chatbot")
+st.markdown("**Powered by Google Gemini 2.0 Flash** | Comprehensive document analysis with advanced retrieval")
 
 # Sidebar
 with st.sidebar:
@@ -129,45 +143,71 @@ with st.sidebar:
     uploaded_file = st.file_uploader("Upload PDF", type=['pdf'])
     
     if uploaded_file and api_key:
-        if st.button("Process PDF"):
-            with st.spinner("Processing PDF..."):
+        if st.button("Process PDF", type="primary"):
+            with st.spinner("🔄 Processing PDF..."):
                 try:
-                    # Extract text
-                    text = extract_pdf_text(uploaded_file)
-                    st.success(f"Extracted {len(text)} characters")
+                    # Extract text with page info
+                    text, page_count = extract_pdf_text(uploaded_file)
+                    
+                    if not text.strip():
+                        st.error("❌ Could not extract text from PDF. Please ensure it's not a scanned image.")
+                        return
+                    
+                    st.info(f"📄 Extracted {len(text):,} characters from {page_count} pages")
                     
                     # Create vectorstore
-                    st.session_state.vectorstore = create_vectorstore(text, api_key)
+                    with st.spinner("🧠 Creating embeddings..."):
+                        st.session_state.vectorstore = create_vectorstore(text, api_key)
                     
                     # Create QA chain
-                    st.session_state.conversation = create_qa_chain(
-                        st.session_state.vectorstore, 
-                        api_key
-                    )
+                    with st.spinner("⚙️ Initializing AI model..."):
+                        st.session_state.conversation = create_qa_chain(
+                            st.session_state.vectorstore, 
+                            api_key
+                        )
                     
-                    st.success("PDF processed successfully!")
+                    st.session_state.pdf_info = {
+                        "name": uploaded_file.name,
+                        "pages": page_count,
+                        "chars": len(text)
+                    }
+                    
+                    st.success("✅ PDF processed successfully! You can now ask questions.")
                 except Exception as e:
-                    st.error(f"Error: {str(e)}")
+                    st.error(f"❌ Error: {str(e)}")
+                    import traceback
+                    st.error(traceback.format_exc())
 
 # Main chat interface
 if st.session_state.conversation:
-    st.subheader("Ask Questions")
+    # Show PDF info
+    if st.session_state.pdf_info:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("📄 Document", st.session_state.pdf_info["name"])
+        with col2:
+            st.metric("📑 Pages", st.session_state.pdf_info["pages"])
+        with col3:
+            st.metric("💬 Questions Asked", len([m for m in st.session_state.chat_history if m["role"] == "user"]))
+    
+    st.divider()
+    st.subheader("💬 Ask Questions")
     
     # Display chat history
     for message in st.session_state.chat_history:
         with st.chat_message(message["role"]):
-            st.write(message["content"])
+            st.markdown(message["content"])
     
     # Chat input
-    if question := st.chat_input("Ask a question about your PDF"):
+    if question := st.chat_input("Ask anything about your PDF..."):
         # Display user message
         with st.chat_message("user"):
-            st.write(question)
+            st.markdown(question)
         st.session_state.chat_history.append({"role": "user", "content": question})
         
         # Get response
         with st.chat_message("assistant"):
-            with st.spinner("Searching PDF..."):
+            with st.spinner("🔍 Analyzing document..."):
                 try:
                     response = st.session_state.conversation({"query": question})
                     
@@ -181,17 +221,45 @@ if st.session_state.conversation:
                     st.markdown(answer)
                     
                     # Show source documents if available
-                    if isinstance(response, dict) and "source_documents" in response:
-                        with st.expander("📄 View Source Excerpts"):
-                            for i, doc in enumerate(response["source_documents"]):
-                                st.markdown(f"**Excerpt {i+1}:**")
-                                st.text(doc.page_content[:300] + "...")
-                                if i < len(response["source_documents"]) - 1:
+                    if isinstance(response, dict) and "source_documents" in response and len(response["source_documents"]) > 0:
+                        with st.expander(f"📚 View {len(response['source_documents'])} Source Excerpts"):
+                            for i, doc in enumerate(response["source_documents"], 1):
+                                st.markdown(f"**Source {i}:**")
+                                # Show more context
+                                content = doc.page_content
+                                if len(content) > 500:
+                                    st.text(content[:500] + "...")
+                                else:
+                                    st.text(content)
+                                
+                                # Show metadata if available
+                                if hasattr(doc, 'metadata') and doc.metadata:
+                                    st.caption(f"Chunk {doc.metadata.get('chunk_id', 'N/A')} of {doc.metadata.get('total_chunks', 'N/A')}")
+                                
+                                if i < len(response["source_documents"]):
                                     st.divider()
                 except Exception as e:
-                    answer = f"Error: {str(e)}"
+                    answer = f"❌ Error processing question: {str(e)}"
                     st.error(answer)
+                    import traceback
+                    with st.expander("🔧 Debug Info"):
+                        st.code(traceback.format_exc())
         
         st.session_state.chat_history.append({"role": "assistant", "content": answer})
 else:
-    st.info("👈 Upload a PDF and enter your API key to start chatting")
+    # Welcome screen
+    st.info("👈 **Get Started:** Upload a PDF and click 'Process PDF' to begin")
+    
+    st.markdown("""
+    ### 🚀 Features:
+    - **Comprehensive Search**: Searches entire PDF with advanced retrieval
+    - **Smart Chunking**: Optimized text splitting for better accuracy
+    - **Context-Aware**: Retrieves multiple relevant sections
+    - **Source Citations**: Shows exact excerpts used for answers
+    - **Production-Grade**: Built for reliability and performance
+    
+    ### 💡 Tips:
+    - Ask specific questions for best results
+    - Try questions about dates, numbers, or specific topics
+    - Review source excerpts to verify answers
+    """)
